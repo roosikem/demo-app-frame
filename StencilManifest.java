@@ -1,20 +1,16 @@
 package com.demo.ejb.faceframe;
 
-import jakarta.json.Json;
-import jakarta.json.JsonArray;
-import jakarta.json.JsonArrayBuilder;
-import jakarta.json.JsonNumber;
-import jakarta.json.JsonObject;
-import jakarta.json.JsonObjectBuilder;
-import jakarta.json.JsonString;
-import jakarta.json.JsonValue;
-import jakarta.json.stream.JsonParser;
+import jakarta.json.bind.Jsonb;
+import jakarta.json.bind.JsonbBuilder;
 
 import java.io.ByteArrayInputStream;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.regex.Pattern;
@@ -29,6 +25,8 @@ import java.util.regex.Pattern;
  *   { "id": "img-star-ring", "file": "Celebration/star-ring.png", "label": "Star ring",
  *     "category": "Celebration", "tags": ["stars"] } ] }
  * </pre>
+ * Read with JSON-B into plain maps and lists, not into classes: that keeps the JSON types (text, number, true/false),
+ * so a wrong type is reported instead of being converted (JSON-B would turn {@code 1.5} into a version 1).
  */
 final class StencilManifest {
 
@@ -69,64 +67,65 @@ final class StencilManifest {
         if (manifest == null) {
             throw new StencilException(FILE_NAME + " is missing in the zip");
         }
-        JsonArray entries = stencilsOf(parse(manifest));
+        try (Jsonb jsonb = JsonbBuilder.create()) {
+            List<?> entries = stencilsOf(parse(jsonb, manifest));
 
-        JsonArrayBuilder stencils = Json.createArrayBuilder();
-        Set<String> ids = new HashSet<>();
-        Set<String> listedFiles = new HashSet<>();
-        for (int i = 0; i < entries.size(); i++) {
-            String where = FILE_NAME + ", stencil " + (i + 1);
-            JsonObject entry = entries.get(i) instanceof JsonObject object ? object : null;
-            if (entry == null) {
-                throw new StencilException(where + ": must be an object");
+            List<Map<String, Object>> stencils = new ArrayList<>(entries.size());
+            Set<String> ids = new HashSet<>();
+            Set<String> listedFiles = new HashSet<>();
+            for (int i = 0; i < entries.size(); i++) {
+                String where = FILE_NAME + ", stencil " + (i + 1);
+                if (!(entries.get(i) instanceof Map<?, ?> entry)) {
+                    throw new StencilException(where + ": must be an object");
+                }
+                String id = id(entry, where);
+                if (!ids.add(id)) {
+                    throw new StencilException(where + ": id " + id + " is used twice");
+                }
+                String file = file(entry, where, imagePaths);
+                if (!listedFiles.add(file)) {
+                    throw new StencilException(where + ": file " + file + " is listed twice");
+                }
+                stencils.add(stencil(entry, where, id, file));
             }
-            String id = id(entry, where);
-            if (!ids.add(id)) {
-                throw new StencilException(where + ": id " + id + " is used twice");
-            }
-            String file = file(entry, where, imagePaths);
-            if (!listedFiles.add(file)) {
-                throw new StencilException(where + ": file " + file + " is listed twice");
-            }
-            stencils.add(stencil(entry, where, id, file));
-        }
 
-        Set<String> unlisted = new TreeSet<>(imagePaths);
-        unlisted.removeAll(listedFiles);
-        if (!unlisted.isEmpty()) {
-            throw new StencilException(FILE_NAME + ": no entry for "
-                    + StencilException.printable(String.join(", ", unlisted)));
-        }
-        return Json.createObjectBuilder()
-                .add("version", VERSION)
-                .add("stencils", stencils)
-                .build()
-                .toString()
-                .getBytes(StandardCharsets.UTF_8);
-    }
-
-    private static JsonObject parse(byte[] manifest) throws StencilException {
-        requireShallow(manifest);
-        try (JsonParser parser = Json.createParser(new ByteArrayInputStream(manifest))) {
-            if (!parser.hasNext() || parser.next() != JsonParser.Event.START_OBJECT) {
-                throw new StencilException(FILE_NAME + ": not a valid JSON object");
+            Set<String> unlisted = new TreeSet<>(imagePaths);
+            unlisted.removeAll(listedFiles);
+            if (!unlisted.isEmpty()) {
+                throw new StencilException(FILE_NAME + ": no entry for "
+                        + StencilException.printable(String.join(", ", unlisted)));
             }
-            JsonObject root = parser.getObject();
-            if (parser.hasNext()) {
-                throw new StencilException(FILE_NAME + ": not a valid JSON object (text after the end)");
-            }
-            return root;
-        } catch (RuntimeException e) {
-            // JsonException, and whatever else a JSON-P implementation throws on broken input
+            // LinkedHashMap: the fields are written in this order
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("version", VERSION);
+            result.put("stencils", stencils);
+            return jsonb.toJson(result).getBytes(StandardCharsets.UTF_8);
+        } catch (StencilException e) {
+            throw e;
+        } catch (Exception e) {
+            // JsonbException on broken input; Jsonb.close() declares Exception
             throw new StencilException(FILE_NAME + ": not a valid JSON object ("
                     + StencilException.printable(String.valueOf(e.getMessage())) + ")", e);
         }
     }
 
-    /** Counts brackets outside of strings, before the parser sees the file. */
-    private static void requireShallow(byte[] manifest) throws StencilException {
+    private static Map<?, ?> parse(Jsonb jsonb, byte[] manifest) throws StencilException {
+        requireShallowSingleObject(manifest);
+        Object root = jsonb.fromJson(new ByteArrayInputStream(manifest), Object.class);
+        if (!(root instanceof Map<?, ?> object)) {
+            throw new StencilException(FILE_NAME + ": not a valid JSON object");
+        }
+        return object;
+    }
+
+    /**
+     * Before the parser sees the file: counts brackets outside of strings, and requires that nothing but white
+     * space follows the first value (JSON-B would ignore text after the end).
+     */
+    private static void requireShallowSingleObject(byte[] manifest) throws StencilException {
         int depth = 0;
         boolean inString = false;
+        boolean ended = false;
         for (int i = 0; i < manifest.length; i++) {
             byte b = manifest[i];
             if (inString) {
@@ -135,6 +134,8 @@ final class StencilManifest {
                 } else if (b == '"') {
                     inString = false;
                 }
+            } else if (ended && !isWhitespace(b)) {
+                throw new StencilException(FILE_NAME + ": not a valid JSON object (text after the end)");
             } else if (b == '"') {
                 inString = true;
             } else if (b == '{' || b == '[') {
@@ -142,23 +143,27 @@ final class StencilManifest {
                     throw new StencilException(FILE_NAME + ": nested more than " + MAX_NESTING + " levels");
                 }
             } else if (b == '}' || b == ']') {
-                depth--;
+                ended = --depth == 0;
             }
         }
     }
 
-    private static JsonArray stencilsOf(JsonObject root) throws StencilException {
-        JsonValue version = root.get("version");
-        if (version != null && !(version instanceof JsonNumber number && isVersion(number))) {
+    private static boolean isWhitespace(byte b) {
+        return b == ' ' || b == '\t' || b == '\n' || b == '\r';
+    }
+
+    private static List<?> stencilsOf(Map<?, ?> root) throws StencilException {
+        Object version = root.get("version");
+        if (version != null && !(version instanceof BigDecimal number && isVersion(number))) {
             throw new StencilException(FILE_NAME + ": version must be " + VERSION);
         }
-        if (!(root.get("stencils") instanceof JsonArray stencils)) {
+        if (!(root.get("stencils") instanceof List<?> stencils)) {
             throw new StencilException(FILE_NAME + ": \"stencils\" list is missing");
         }
         return stencils;
     }
 
-    private static boolean isVersion(JsonNumber number) {
+    private static boolean isVersion(BigDecimal number) {
         try {
             return number.intValueExact() == VERSION;
         } catch (ArithmeticException notAnInt) {
@@ -166,7 +171,7 @@ final class StencilManifest {
         }
     }
 
-    private static String id(JsonObject entry, String where) throws StencilException {
+    private static String id(Map<?, ?> entry, String where) throws StencilException {
         String id = requiredString(entry, "id", where);
         if (!SAFE_ID.matcher(id).matches()) {
             throw new StencilException(where + ": id " + StencilException.printable(id)
@@ -175,7 +180,7 @@ final class StencilManifest {
         return id;
     }
 
-    private static String file(JsonObject entry, String where, Set<String> imagePaths) throws StencilException {
+    private static String file(Map<?, ?> entry, String where, Set<String> imagePaths) throws StencilException {
         String file = requiredString(entry, "file", where);
         if (!imagePaths.contains(file)) {
             throw new StencilException(where + ": file " + StencilException.printable(file)
@@ -184,43 +189,42 @@ final class StencilManifest {
         return file;
     }
 
-    private static JsonObject stencil(JsonObject entry, String where, String id, String file)
+    private static Map<String, Object> stencil(Map<?, ?> entry, String where, String id, String file)
             throws StencilException {
-        JsonObjectBuilder stencil = Json.createObjectBuilder()
-                .add("id", id)
-                .add("file", file)
-                .add("label", text(requiredString(entry, "label", where), MAX_LABEL, where + ", label"))
-                .add("category", text(requiredString(entry, "category", where), MAX_CATEGORY, where + ", category"));
+        Map<String, Object> stencil = new LinkedHashMap<>();
+        stencil.put("id", id);
+        stencil.put("file", file);
+        stencil.put("label", text(requiredString(entry, "label", where), MAX_LABEL, where + ", label"));
+        stencil.put("category", text(requiredString(entry, "category", where), MAX_CATEGORY, where + ", category"));
         List<String> tags = tags(entry, where);
         if (!tags.isEmpty()) {
-            stencil.add("tags", Json.createArrayBuilder(tags));
+            stencil.put("tags", tags);
         }
-        return stencil.build();
+        return stencil;
     }
 
-    private static List<String> tags(JsonObject entry, String where) throws StencilException {
-        JsonValue value = entry.get("tags");
-        if (value == null) {
+    private static List<String> tags(Map<?, ?> entry, String where) throws StencilException {
+        if (!entry.containsKey("tags")) {
             return List.of();
         }
-        if (!(value instanceof JsonArray array) || array.size() > MAX_TAGS) {
+        if (!(entry.get("tags") instanceof List<?> list) || list.size() > MAX_TAGS) {
             throw new StencilException(where + ": tags must be a list of at most " + MAX_TAGS + " texts");
         }
-        List<String> tags = new ArrayList<>(array.size());
-        for (JsonValue tag : array) {
-            if (!(tag instanceof JsonString text)) {
+        List<String> tags = new ArrayList<>(list.size());
+        for (Object tag : list) {
+            if (!(tag instanceof String text)) {
                 throw new StencilException(where + ": tags must be texts");
             }
-            tags.add(text(text.getString(), MAX_TAG, where + ", tag"));
+            tags.add(text(text, MAX_TAG, where + ", tag"));
         }
         return tags;
     }
 
-    private static String requiredString(JsonObject entry, String key, String where) throws StencilException {
-        if (!(entry.get(key) instanceof JsonString value)) {
+    private static String requiredString(Map<?, ?> entry, String key, String where) throws StencilException {
+        if (!(entry.get(key) instanceof String value)) {
             throw new StencilException(where + ": \"" + key + "\" is missing or not a text");
         }
-        return value.getString();
+        return value;
     }
 
     private static String text(String value, int maxLength, String where) throws StencilException {
