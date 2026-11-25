@@ -15,8 +15,8 @@ import javax.imageio.stream.ImageInputStream;
 import javax.imageio.stream.MemoryCacheImageInputStream;
 
 /**
- * Validates stencil images: complete PNG file structure, size and transparency, then decodes the image once so
- * damaged image data is found at load time and not in the browser.
+ * Validates stencil and sticker images: complete PNG file structure, size and transparency, then decodes the image
+ * once so damaged image data is found at load time and not in the browser.
  */
 final class StencilImage {
 
@@ -24,6 +24,9 @@ final class StencilImage {
 
     /** Stencil template size: square canvas, frame inside a radius of 504 px around the centre. */
     private static final int REQUIRED_SIZE_PX = 1024;
+    /** Stickers are square; the editor shows them at up to 60 % of the exported frame (max. 4096 px). */
+    private static final int STICKER_MIN_PX = 128;
+    private static final int STICKER_MAX_PX = 1024;
 
     private static final byte[] PNG_SIGNATURE = {(byte) 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
     /** Length, type and CRC around every chunk's data. */
@@ -35,6 +38,18 @@ final class StencilImage {
     }
 
     static void validate(String path, byte[] data) throws StencilException {
+        validate(path, data, (width, height) -> width == REQUIRED_SIZE_PX && height == REQUIRED_SIZE_PX,
+                "must be " + REQUIRED_SIZE_PX + " x " + REQUIRED_SIZE_PX);
+    }
+
+    static void validateSticker(String path, byte[] data) throws StencilException {
+        validate(path, data,
+                (width, height) -> width == height && width >= STICKER_MIN_PX && width <= STICKER_MAX_PX,
+                "must be square, " + STICKER_MIN_PX + " to " + STICKER_MAX_PX + " px");
+    }
+
+    private static void validate(String path, byte[] data, SizeRule sizeRule, String sizeHint)
+            throws StencilException {
         requireCompletePng(path, data);
         ImageReader reader = pngReader();
         // memory-backed stream: ImageIO would otherwise buffer to a temp file
@@ -42,15 +57,14 @@ final class StencilImage {
             reader.setInput(in, true, true);
             int width = reader.getWidth(0);
             int height = reader.getHeight(0);
-            if (width != REQUIRED_SIZE_PX || height != REQUIRED_SIZE_PX) {
-                throw new StencilException(path + ": " + width + " x " + height
-                        + " px, must be " + REQUIRED_SIZE_PX + " x " + REQUIRED_SIZE_PX);
+            if (!sizeRule.allows(width, height)) {
+                throw new StencilException(path + ": " + width + " x " + height + " px, " + sizeHint);
             }
             ImageTypeSpecifier type = reader.getRawImageType(0);
             if (type == null || !type.getColorModel().hasAlpha()) {
                 throw new StencilException(path + ": no transparency, the photo would be covered");
             }
-            // size is fixed above, so this is at most 1024 x 1024 pixels
+            // the size rules keep this at most 1024 x 1024 pixels
             reader.read(0);
         } catch (IOException | RuntimeException e) {
             throw new StencilException(path + ": not a valid PNG file", e);
@@ -103,6 +117,11 @@ final class StencilImage {
             }
         }
         throw new StencilException(path + ": not a valid PNG file (cut off)");
+    }
+
+    @FunctionalInterface
+    private interface SizeRule {
+        boolean allows(int width, int height);
     }
 
     /** Upper case first letter = critical chunk. */

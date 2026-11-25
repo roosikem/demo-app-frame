@@ -3,7 +3,6 @@ package com.demo.ejb.faceframe;
 import jakarta.json.bind.Jsonb;
 import jakarta.json.bind.JsonbBuilder;
 
-import java.io.ByteArrayInputStream;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -19,11 +18,14 @@ import java.util.regex.Pattern;
  * Checks the {@code stencils.json} delivered in the stencil zip against the images in the same zip.
  * <p>
  * The file is the master list: every image is listed exactly once, every entry has its image, ids are unique. Only
- * the known fields are passed on to the browser, in the order of the file. Format:
+ * the known fields are passed on to the browser, in the order of the file. Stickers are optional and live in the
+ * folder {@code stickers/}. Format:
  * <pre>
  * { "version": 1, "stencils": [
  *   { "id": "img-star-ring", "file": "Celebration/star-ring.png", "label": "Star ring",
- *     "category": "Celebration", "tags": ["stars"] } ] }
+ *     "category": "Celebration", "tags": ["stars"] } ],
+ *   "stickers": [
+ *   { "id": "heart", "file": "stickers/heart.png", "label": "Heart" } ] }
  * </pre>
  * Read with JSON-B into plain maps and lists, not into classes: that keeps the JSON types (text, number, true/false),
  * so a wrong type is reported instead of being converted (JSON-B would turn {@code 1.5} into a version 1).
@@ -39,6 +41,8 @@ final class StencilManifest {
      * (the editor ignores a stencil whose id is already taken).
      */
     private static final Pattern SAFE_ID = Pattern.compile("img-[A-Za-z0-9][\\w-]{0,59}");
+    /** Stickers have their own list, so no prefix; same characters and length as the sticker ids in the editor. */
+    private static final Pattern SAFE_STICKER_ID = Pattern.compile("[A-Za-z0-9][\\w-]{0,63}");
     /**
      * Control characters, line/paragraph separators, text direction controls, byte order mark and HTML brackets.
      * Other invisible characters stay allowed: zero width (non-)joiner and soft hyphen are needed for emoji
@@ -47,58 +51,54 @@ final class StencilManifest {
     private static final Pattern UNSAFE_CHARS =
             Pattern.compile("[\\p{Cc}\\p{Zl}\\p{Zp}\\u061C\\u200E\\u200F\\u202A-\\u202E\\u2066-\\u2069\\uFEFF<>]");
     private static final Pattern EDGE_SPACE = Pattern.compile("(?:^[\\p{Z}\\s]+)|(?:[\\p{Z}\\s]+$)");
-    /** The format is two levels deep; this also keeps a hostile file away from the parser's recursion. */
-    private static final int MAX_NESTING = 8;
     // the editor cuts longer texts (counted in UTF-16 units, like String.length()), so they are rejected here
     private static final int MAX_LABEL = 40;
     private static final int MAX_CATEGORY = 30;
     private static final int MAX_TAGS = 10;
     private static final int MAX_TAG = 30;
 
+    /** The two lists in the file; the word is used in the messages. */
+    private enum Kind {
+        STENCIL("stencil"),
+        STICKER("sticker");
+
+        private final String word;
+
+        Kind(String word) {
+            this.word = word;
+        }
+    }
+
     private StencilManifest() {
     }
 
     /**
      * @param manifest   {@code stencils.json} from the zip, or {@code null} when the zip has none
-     * @param imagePaths paths of the validated images, e.g. {@code Celebration/confetti.png}
+     * @param imagePaths paths of the validated images, e.g. {@code Celebration/confetti.png} or
+     *                   {@code stickers/heart.png}
      * @return the checked manifest as served to the browser
      */
     static byte[] check(byte[] manifest, Set<String> imagePaths) throws StencilException {
         if (manifest == null) {
             throw new StencilException(FILE_NAME + " is missing in the zip");
         }
+        Set<String> stencilFiles = new TreeSet<>();
+        Set<String> stickerFiles = new TreeSet<>();
+        for (String path : imagePaths) {
+            (StencilZipService.isSticker(path) ? stickerFiles : stencilFiles).add(path);
+        }
         try (Jsonb jsonb = JsonbBuilder.create()) {
-            List<?> entries = stencilsOf(parse(jsonb, manifest));
+            Map<?, ?> root = JsonObjects.parse(jsonb, manifest, FILE_NAME);
+            List<Map<String, Object>> stencils = entries(stencilsOf(root), Kind.STENCIL, stencilFiles);
+            List<Map<String, Object>> stickers = entries(stickersOf(root), Kind.STICKER, stickerFiles);
 
-            List<Map<String, Object>> stencils = new ArrayList<>(entries.size());
-            Set<String> ids = new HashSet<>();
-            Set<String> listedFiles = new HashSet<>();
-            for (int i = 0; i < entries.size(); i++) {
-                String where = FILE_NAME + ", stencil " + (i + 1);
-                if (!(entries.get(i) instanceof Map<?, ?> entry)) {
-                    throw new StencilException(where + ": must be an object");
-                }
-                String id = id(entry, where);
-                if (!ids.add(id)) {
-                    throw new StencilException(where + ": id " + id + " is used twice");
-                }
-                String file = file(entry, where, imagePaths);
-                if (!listedFiles.add(file)) {
-                    throw new StencilException(where + ": file " + file + " is listed twice");
-                }
-                stencils.add(stencil(entry, where, id, file));
-            }
-
-            Set<String> unlisted = new TreeSet<>(imagePaths);
-            unlisted.removeAll(listedFiles);
-            if (!unlisted.isEmpty()) {
-                throw new StencilException(FILE_NAME + ": no entry for "
-                        + StencilException.printable(String.join(", ", unlisted)));
-            }
             // LinkedHashMap: the fields are written in this order
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("version", VERSION);
             result.put("stencils", stencils);
+            if (!stickers.isEmpty()) {
+                result.put("stickers", stickers);
+            }
             return jsonb.toJson(result).getBytes(StandardCharsets.UTF_8);
         } catch (StencilException e) {
             throw e;
@@ -107,49 +107,6 @@ final class StencilManifest {
             throw new StencilException(FILE_NAME + ": not a valid JSON object ("
                     + StencilException.printable(String.valueOf(e.getMessage())) + ")", e);
         }
-    }
-
-    private static Map<?, ?> parse(Jsonb jsonb, byte[] manifest) throws StencilException {
-        requireShallowSingleObject(manifest);
-        Object root = jsonb.fromJson(new ByteArrayInputStream(manifest), Object.class);
-        if (!(root instanceof Map<?, ?> object)) {
-            throw new StencilException(FILE_NAME + ": not a valid JSON object");
-        }
-        return object;
-    }
-
-    /**
-     * Before the parser sees the file: counts brackets outside of strings, and requires that nothing but white
-     * space follows the first value (JSON-B would ignore text after the end).
-     */
-    private static void requireShallowSingleObject(byte[] manifest) throws StencilException {
-        int depth = 0;
-        boolean inString = false;
-        boolean ended = false;
-        for (int i = 0; i < manifest.length; i++) {
-            byte b = manifest[i];
-            if (inString) {
-                if (b == '\\') {
-                    i++; // skip the escaped character
-                } else if (b == '"') {
-                    inString = false;
-                }
-            } else if (ended && !isWhitespace(b)) {
-                throw new StencilException(FILE_NAME + ": not a valid JSON object (text after the end)");
-            } else if (b == '"') {
-                inString = true;
-            } else if (b == '{' || b == '[') {
-                if (++depth > MAX_NESTING) {
-                    throw new StencilException(FILE_NAME + ": nested more than " + MAX_NESTING + " levels");
-                }
-            } else if (b == '}' || b == ']') {
-                ended = --depth == 0;
-            }
-        }
-    }
-
-    private static boolean isWhitespace(byte b) {
-        return b == ' ' || b == '\t' || b == '\n' || b == '\r';
     }
 
     private static List<?> stencilsOf(Map<?, ?> root) throws StencilException {
@@ -161,6 +118,52 @@ final class StencilManifest {
             throw new StencilException(FILE_NAME + ": \"stencils\" list is missing");
         }
         return stencils;
+    }
+
+    /** Optional: a zip without stickers needs no list. */
+    private static List<?> stickersOf(Map<?, ?> root) throws StencilException {
+        if (!root.containsKey("stickers")) {
+            return List.of();
+        }
+        if (!(root.get("stickers") instanceof List<?> stickers)) {
+            throw new StencilException(FILE_NAME + ": \"stickers\" must be a list");
+        }
+        return stickers;
+    }
+
+    /**
+     * Checks one list against its images: each entry an object with a unique id, each image listed exactly once.
+     *
+     * @param files the images this list must describe
+     */
+    private static List<Map<String, Object>> entries(List<?> list, Kind kind, Set<String> files)
+            throws StencilException {
+        boolean sticker = kind == Kind.STICKER;
+        List<Map<String, Object>> result = new ArrayList<>(list.size());
+        Set<String> ids = new HashSet<>();
+        Set<String> listedFiles = new HashSet<>();
+        for (int i = 0; i < list.size(); i++) {
+            String where = FILE_NAME + ", " + kind.word + " " + (i + 1);
+            if (!(list.get(i) instanceof Map<?, ?> entry)) {
+                throw new StencilException(where + ": must be an object");
+            }
+            String id = sticker ? stickerId(entry, where) : id(entry, where);
+            if (!ids.add(id)) {
+                throw new StencilException(where + ": id " + id + " is used twice");
+            }
+            String file = file(entry, where, files);
+            if (!listedFiles.add(file)) {
+                throw new StencilException(where + ": file " + file + " is listed twice");
+            }
+            result.add(sticker ? sticker(entry, where, id, file) : stencil(entry, where, id, file));
+        }
+        Set<String> unlisted = new TreeSet<>(files);
+        unlisted.removeAll(listedFiles);
+        if (!unlisted.isEmpty()) {
+            throw new StencilException(FILE_NAME + ": no " + kind.word + " entry for "
+                    + StencilException.printable(String.join(", ", unlisted)));
+        }
+        return result;
     }
 
     private static boolean isVersion(BigDecimal number) {
@@ -180,13 +183,32 @@ final class StencilManifest {
         return id;
     }
 
-    private static String file(Map<?, ?> entry, String where, Set<String> imagePaths) throws StencilException {
+    private static String stickerId(Map<?, ?> entry, String where) throws StencilException {
+        String id = requiredString(entry, "id", where);
+        if (!SAFE_STICKER_ID.matcher(id).matches()) {
+            throw new StencilException(where + ": id " + StencilException.printable(id)
+                    + " must contain only A-Z, a-z, 0-9, _ and - (max. 64 characters)");
+        }
+        return id;
+    }
+
+    /** The file must be one of the images of this list: stickers only from {@code stickers/}, stencils never. */
+    private static String file(Map<?, ?> entry, String where, Set<String> files) throws StencilException {
         String file = requiredString(entry, "file", where);
-        if (!imagePaths.contains(file)) {
+        if (!files.contains(file)) {
             throw new StencilException(where + ": file " + StencilException.printable(file)
-                    + " is not in the zip (names are case-sensitive)");
+                    + " is not in the zip (names are case-sensitive; stickers belong in stickers/, stencils not)");
         }
         return file;
+    }
+
+    private static Map<String, Object> sticker(Map<?, ?> entry, String where, String id, String file)
+            throws StencilException {
+        Map<String, Object> sticker = new LinkedHashMap<>();
+        sticker.put("id", id);
+        sticker.put("file", file);
+        sticker.put("label", text(requiredString(entry, "label", where), MAX_LABEL, where + ", label"));
+        return sticker;
     }
 
     private static Map<String, Object> stencil(Map<?, ?> entry, String where, String id, String file)

@@ -16,8 +16,8 @@ import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.StreamingOutput;
 
 /**
- * Serves the FaceFrame stencils from {@link StencilCache}:
- * {@code GET /api/face-frame/stencils/stencils.json} and {@code GET /api/face-frame/stencils/{file}}.
+ * Serves the FaceFrame stencils from {@link StencilCache}: {@code GET /api/face-frame/stencils/stencils.json},
+ * {@code .../face-frame-settings.json} (when the zip has one) and {@code GET /api/face-frame/stencils/{file}}.
  */
 @Path("/face-frame/stencils")
 @RequestScoped
@@ -65,10 +65,10 @@ public class StencilResource {
                 .build();
     }
 
-    /** The manifest is revalidated on every load so new stencils appear; images are cached for a day. */
+    /** The JSON files are revalidated on every load so new stencils and settings appear; images are cached a day. */
     private static CacheControl cacheControl(String path) {
         CacheControl cacheControl = new CacheControl();
-        if (StencilCache.MANIFEST.equals(path)) {
+        if (path.endsWith(".json")) {
             cacheControl.setNoCache(true);
         } else {
             cacheControl.setMaxAge(IMAGE_MAX_AGE_SECONDS);

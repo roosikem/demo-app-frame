@@ -17,7 +17,9 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
 /**
- * Loads the FaceFrame stencil zip (PNG images plus {@code stencils.json}) and unpacks it into memory.
+ * Loads the FaceFrame stencil zip (PNG images plus {@code stencils.json}) and unpacks it into memory. Images in the
+ * folder {@value #STICKER_FOLDER} are stickers, all others are stencils. An optional {@code face-frame-settings.json}
+ * holds editor settings; a broken one is left out (logged), the stencils are still served.
  * <p>
  * The zip is read from the file storage ({@link StencilStorage}) under the file id configured with the system
  * property {@value #FILE_ID_PROPERTY} or the environment variable {@value #FILE_ID_ENV}. A zip is accepted as a
@@ -29,7 +31,9 @@ public class StencilZipService {
     static final String FILE_ID_PROPERTY = "faceframe.stencils.file-id";
     static final String FILE_ID_ENV = "FACEFRAME_STENCILS_FILE_ID";
 
+    static final String STICKER_FOLDER = "stickers/";
     static final int MAX_STENCILS = 200;
+    static final int MAX_STICKERS = 100;
     static final int MAX_FILE_BYTES = 1024 * 1024;
     static final long MAX_TOTAL_BYTES = 50L * 1024 * 1024;
     /** Room for the stencils plus folders and files that are skipped (e.g. {@code __MACOSX/}). */
@@ -69,8 +73,12 @@ public class StencilZipService {
         }
         Map<String, StencilFile> files = unpack(zip);
         long bytes = files.values().stream().mapToLong(StencilFile::size).sum();
-        LOG.info(() -> String.format(Locale.ROOT, "Loaded %d stencils (%.1f MB) from file id %s",
-                files.size() - 1, bytes / (1024.0 * 1024.0), StencilException.printable(fileId)));
+        long stickers = files.keySet().stream().filter(StencilZipService::isSticker).count();
+        long stencils = files.keySet().stream().filter(p -> p.endsWith(".png") && !isSticker(p)).count();
+        boolean settings = files.containsKey(StencilSettings.FILE_NAME);
+        LOG.info(() -> String.format(Locale.ROOT, "Loaded %d stencils, %d stickers%s (%.1f MB) from file id %s",
+                stencils, stickers, settings ? " and editor settings" : "", bytes / (1024.0 * 1024.0),
+                StencilException.printable(fileId)));
         return files;
     }
 
@@ -92,8 +100,11 @@ public class StencilZipService {
         }
         Map<String, StencilFile> images = new TreeMap<>();
         byte[] manifest = null;
+        byte[] settings = null;
         long totalBytes = 0;
         int entries = 0;
+        int stencils = 0;
+        int stickers = 0;
 
         try (ZipInputStream in = new ZipInputStream(new ByteArrayInputStream(zip), StandardCharsets.UTF_8)) {
             for (ZipEntry entry = in.getNextEntry(); entry != null; entry = in.getNextEntry()) {
@@ -103,11 +114,19 @@ public class StencilZipService {
                 String path = entry.getName();
                 boolean skipped = entry.isDirectory() || isIgnored(path);
                 boolean isManifest = path.equals(StencilManifest.FILE_NAME);
+                boolean isSettings = path.equals(StencilSettings.FILE_NAME);
                 // the name is checked before anything is read
                 if (isManifest) {
-                    requireSingleManifest(manifest);
+                    requireSingle(manifest, path);
+                } else if (isSettings) {
+                    requireSingle(settings, path);
                 } else if (!skipped) {
                     requireValidPath(path, images);
+                    if (isSticker(path)) {
+                        requireRoom(++stickers, MAX_STICKERS, "stickers");
+                    } else {
+                        requireRoom(++stencils, MAX_STENCILS, "stencils");
+                    }
                 }
                 // skipped entries are read too: moving to the next entry would unpack them without a limit
                 byte[] data = read(in, StencilException.printable(path));
@@ -120,10 +139,18 @@ public class StencilZipService {
                 }
                 if (isManifest) {
                     manifest = data;
+                    continue;
+                }
+                if (isSettings) {
+                    settings = data;
+                    continue;
+                }
+                if (isSticker(path)) {
+                    StencilImage.validateSticker(path, data);
                 } else {
                     StencilImage.validate(path, data);
-                    images.put(path, StencilFile.of(data, StencilImage.CONTENT_TYPE));
                 }
+                images.put(path, StencilFile.of(data, StencilImage.CONTENT_TYPE));
             }
         } catch (IOException | IllegalArgumentException e) {
             // IllegalArgumentException: entry name that is not valid UTF-8
@@ -137,12 +164,29 @@ public class StencilZipService {
         Map<String, StencilFile> files = new HashMap<>(images);
         byte[] checked = StencilManifest.check(manifest, images.keySet());
         files.put(StencilManifest.FILE_NAME, StencilFile.of(checked, StencilManifest.CONTENT_TYPE));
+        if (settings != null) {
+            addSettings(files, settings);
+        }
         return files;
     }
 
-    private static void requireSingleManifest(byte[] manifest) throws StencilException {
-        if (manifest != null) {
-            throw new StencilException(StencilManifest.FILE_NAME + ": duplicate entry");
+    /** Settings only change how the editor behaves: a broken file must not cost the stencils. */
+    private static void addSettings(Map<String, StencilFile> files, byte[] settings) {
+        try {
+            StencilSettings.Checked checked = StencilSettings.check(settings);
+            if (!checked.dropped().isEmpty()) {
+                LOG.warning(() -> StencilSettings.FILE_NAME + ": unknown or wrong type, left out: "
+                        + String.join(", ", checked.dropped()));
+            }
+            files.put(StencilSettings.FILE_NAME, StencilFile.of(checked.json(), StencilSettings.CONTENT_TYPE));
+        } catch (StencilException e) {
+            LOG.warning(() -> e.getMessage() + "; the editor uses its own settings");
+        }
+    }
+
+    private static void requireSingle(byte[] earlier, String path) throws StencilException {
+        if (earlier != null) {
+            throw new StencilException(path + ": duplicate entry");
         }
     }
 
@@ -154,9 +198,17 @@ public class StencilZipService {
         if (images.containsKey(path)) {
             throw new StencilException(path + ": duplicate entry");
         }
-        if (images.size() >= MAX_STENCILS) {
-            throw new StencilException("Zip contains more than " + MAX_STENCILS + " stencils");
+    }
+
+    private static void requireRoom(int count, int max, String what) throws StencilException {
+        if (count > max) {
+            throw new StencilException("Zip contains more than " + max + " " + what);
         }
+    }
+
+    /** Case-sensitive like all paths in the zip: {@code Stickers/} is a stencil category. */
+    static boolean isSticker(String path) {
+        return path.startsWith(STICKER_FOLDER);
     }
 
     /** Reads at most one byte past the limit: the size declared in the zip is not trusted. */
